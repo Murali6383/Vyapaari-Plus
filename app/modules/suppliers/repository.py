@@ -1,0 +1,1 @@
+"""Repository for suppliers module."""

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vyapaari-plus"
+version = "1.0.0"
+description = "AI-first Windows Desktop Business Operating System for Indian MSMEs"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Tech Tomorrow Engineering", email = "engineering@techtomorrow.in" }
+]

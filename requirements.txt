@@ -1,0 +1,21 @@
+# Core Dependencies
+pyside6>=6.7.0
+sqlalchemy>=2.0.30
+alembic>=1.13.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.1
+loguru>=0.7.2
+
+# Data & Analytics
+pandas>=2.2.2
+numpy>=1.26.4
+matplotlib>=3.8.4
+reportlab>=4.2.0
+openpyxl>=3.1.2
+
+# Testing
+pytest>=8.2.0
+pytest-cov>=5.0.0
+pytest-qt>=4.4.0
+pytest-mock>=3.14.0
