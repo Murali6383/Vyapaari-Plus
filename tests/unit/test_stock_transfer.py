@@ -35,3 +35,53 @@ def test_stock_transfer_lifecycle(db_session):
     assert rec_log.variance_units == 1
     assert rec_log.total_transit_loss_value == 450.0
     assert transfer.status == TransferStatus.DISPUTED
+def test_create_transfer_rejects_non_positive_quantity(db_session):
+    b1 = Branch(id="b1", name="Warehouse", code="WH-01", is_warehouse=True)
+    b2 = Branch(id="b2", name="Store", code="STR-02", is_warehouse=False)
+    db_session.add_all([b1, b2])
+    db_session.commit()
+
+    service = StockTransferService(db_session)
+
+    with pytest.raises(Exception):
+        service.create_transfer_request(
+            "b1",
+            "b2",
+            [{"product_id": "p1", "quantity_dispatched": 0}],
+        )
+
+    assert db_session.query(
+        __import__(
+            "app.modules.inventory.models",
+            fromlist=["StockTransfer"],
+        ).StockTransfer
+    ).count() == 0
+
+
+def test_receive_rejects_quantity_above_dispatched(db_session):
+    b1 = Branch(id="b1", name="Warehouse", code="WH-01", is_warehouse=True)
+    b2 = Branch(id="b2", name="Store", code="STR-02", is_warehouse=False)
+    db_session.add_all([b1, b2])
+    db_session.commit()
+
+    service = StockTransferService(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [{"product_id": "p1", "quantity_dispatched": 5}],
+    )
+    service.dispatch_transfer(transfer.id)
+
+    with pytest.raises(Exception):
+        service.receive_and_record_delivery(
+            transfer.id,
+            [{
+                "item_id": transfer.items[0].id,
+                "quantity_received": 6,
+            }],
+        )
+
+    db_session.rollback()
+
+    assert transfer.status == TransferStatus.IN_TRANSIT

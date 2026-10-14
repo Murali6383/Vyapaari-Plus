@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from app.modules.inventory.models import StockTransfer, TransferStatus, ReconciliationLog
 from app.core.exceptions import EntityNotFoundError, ValidationError
@@ -43,7 +43,7 @@ class MultiBranchReconciliationEngine:
                 variance_units=variance,
                 total_transit_loss_value=transit_loss_val,
                 reconciled_by=reconciled_by,
-                reconciled_at=datetime.utcnow(),
+                reconciled_at=datetime.now(timezone.utc),
                 resolution_status=resolution_status,
                 remarks=remarks
             )
@@ -54,7 +54,7 @@ class MultiBranchReconciliationEngine:
             log.variance_units = variance
             log.total_transit_loss_value = transit_loss_val
             log.reconciled_by = reconciled_by
-            log.reconciled_at = datetime.utcnow()
+            log.reconciled_at = datetime.now(timezone.utc)
             log.resolution_status = resolution_status
             log.remarks = remarks
 
