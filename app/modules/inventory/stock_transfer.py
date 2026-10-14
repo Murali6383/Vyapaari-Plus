@@ -14,32 +14,31 @@ from app.modules.inventory.models import (
 
 
 class StockTransferService:
-    """Service handling inter-store stock transfer lifecycle and tracking."""
+    """Manage stock transfer lifecycle, delivery and carrier tracking."""
 
     def __init__(self, db: Session):
         self.db = db
 
     @staticmethod
     def _utc_now() -> datetime:
-        """Return a timezone-aware UTC timestamp."""
         return datetime.now(timezone.utc)
 
     def _get_transfer(self, transfer_id: str) -> StockTransfer:
-        """Fetch a transfer or raise a not-found exception."""
+        """Fetch a transfer with a row lock where supported by the database."""
         transfer = (
             self.db.query(StockTransfer)
             .filter(StockTransfer.id == transfer_id)
+            .with_for_update()
             .first()
         )
 
-        if not transfer:
+        if transfer is None:
             raise EntityNotFoundError("StockTransfer", transfer_id)
 
         return transfer
 
     @staticmethod
     def _document_number(prefix: str) -> str:
-        """Generate a unique document reference."""
         date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
         unique_part = uuid.uuid4().hex[:10].upper()
         return f"{prefix}-{date_part}-{unique_part}"
@@ -52,7 +51,7 @@ class StockTransferService:
         details: str = None,
         logged_by: str = None,
     ) -> CarrierLog:
-        """Add a tracking event to the current database transaction."""
+        """Add an event to the current transaction."""
         log = CarrierLog(
             id=str(uuid.uuid4()),
             transfer_id=transfer.id,
@@ -73,7 +72,7 @@ class StockTransferService:
         dispatched_by: str = None,
         notes: str = None,
     ) -> StockTransfer:
-        """Create a transfer request after validating all items."""
+        """Create a validated draft transfer and its audit event."""
 
         if not source_branch_id or not destination_branch_id:
             raise ValidationError(
@@ -82,7 +81,7 @@ class StockTransferService:
 
         if source_branch_id == destination_branch_id:
             raise ValidationError(
-                "Source and destination branch cannot be the same."
+                "Source and destination branches cannot be the same."
             )
 
         if not isinstance(items, list) or not items:
@@ -90,17 +89,19 @@ class StockTransferService:
                 "Transfer must contain at least one item."
             )
 
+        validated_items = []
+
         for item_data in items:
             if not isinstance(item_data, dict):
                 raise ValidationError(
                     "Each transfer item must be a dictionary."
                 )
 
-            if not item_data.get("product_id"):
+            product_id = item_data.get("product_id")
+            if not isinstance(product_id, str) or not product_id.strip():
                 raise ValidationError("Product ID is required.")
 
             quantity = item_data.get("quantity_dispatched")
-
             if (
                 isinstance(quantity, bool)
                 or not isinstance(quantity, int)
@@ -111,7 +112,6 @@ class StockTransferService:
                 )
 
             unit_cost = item_data.get("unit_cost", 0.0)
-
             if (
                 isinstance(unit_cost, bool)
                 or not isinstance(unit_cost, (int, float))
@@ -120,6 +120,18 @@ class StockTransferService:
                 raise ValidationError(
                     "Unit cost must be a non-negative number."
                 )
+
+            validated_items.append(
+                {
+                    "product_id": product_id.strip(),
+                    "product_name": item_data.get(
+                        "product_name", "Unknown Product"
+                    ),
+                    "batch_number": item_data.get("batch_number"),
+                    "quantity_dispatched": quantity,
+                    "unit_cost": float(unit_cost),
+                }
+            )
 
         transfer = StockTransfer(
             id=str(uuid.uuid4()),
@@ -135,23 +147,25 @@ class StockTransferService:
             self.db.add(transfer)
             self.db.flush()
 
-            for item_data in items:
-                item = TransferItem(
-                    id=str(uuid.uuid4()),
-                    transfer_id=transfer.id,
-                    product_id=item_data["product_id"],
-                    product_name=item_data.get(
-                        "product_name", "Unknown Product"
-                    ),
-                    batch_number=item_data.get("batch_number"),
-                    quantity_dispatched=item_data["quantity_dispatched"],
-                    quantity_received=0,
-                    unit_cost=item_data.get("unit_cost", 0.0),
+            for item_data in validated_items:
+                self.db.add(
+                    TransferItem(
+                        id=str(uuid.uuid4()),
+                        transfer_id=transfer.id,
+                        product_id=item_data["product_id"],
+                        product_name=item_data["product_name"],
+                        batch_number=item_data["batch_number"],
+                        quantity_dispatched=item_data[
+                            "quantity_dispatched"
+                        ],
+                        quantity_received=0,
+                        quantity_damaged=0,
+                        unit_cost=item_data["unit_cost"],
+                    )
                 )
-                self.db.add(item)
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="TRANSFER_CREATED",
                 details="Stock transfer request created.",
                 logged_by=dispatched_by,
@@ -169,7 +183,7 @@ class StockTransferService:
         self,
         transfer_id: str,
     ) -> StockTransfer:
-        """Generate a delivery challan and gate pass for a draft transfer."""
+        """Generate delivery challan and gate pass for a draft transfer."""
 
         transfer = self._get_transfer(transfer_id)
 
@@ -191,10 +205,12 @@ class StockTransferService:
                 )
 
             if not transfer.gate_pass_number:
-                transfer.gate_pass_number = self._document_number("GATE")
+                transfer.gate_pass_number = (
+                    self._document_number("GATE")
+                )
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="DOCUMENTS_GENERATED",
                 details=(
                     f"Challan: {transfer.delivery_challan_number}; "
@@ -216,7 +232,7 @@ class StockTransferService:
         vehicle_number: str = None,
         driver_contact: str = None,
     ) -> StockTransfer:
-        """Dispatch a draft transfer and generate documents if needed."""
+        """Dispatch a draft transfer and create delivery documents."""
 
         transfer = self._get_transfer(transfer_id)
 
@@ -232,14 +248,15 @@ class StockTransferService:
             )
 
         try:
-            # Automatically generate documents when not generated earlier.
             if not transfer.delivery_challan_number:
                 transfer.delivery_challan_number = (
                     self._document_number("CHL")
                 )
 
             if not transfer.gate_pass_number:
-                transfer.gate_pass_number = self._document_number("GATE")
+                transfer.gate_pass_number = (
+                    self._document_number("GATE")
+                )
 
             transfer.status = TransferStatus.DISPATCHED
             transfer.dispatched_at = self._utc_now()
@@ -247,7 +264,7 @@ class StockTransferService:
             transfer.driver_contact = driver_contact
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="DISPATCHED",
                 details=(
                     f"Vehicle: {vehicle_number or 'Not provided'}; "
@@ -266,7 +283,7 @@ class StockTransferService:
             raise
 
     def start_transit(self, transfer_id: str) -> StockTransfer:
-        """Mark a dispatched transfer as being in transit."""
+        """Move a dispatched transfer into transit."""
 
         transfer = self._get_transfer(transfer_id)
 
@@ -280,7 +297,7 @@ class StockTransferService:
             transfer.status = TransferStatus.IN_TRANSIT
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="IN_TRANSIT",
                 details="Transfer has started transit.",
             )
@@ -302,7 +319,7 @@ class StockTransferService:
         driver_contact: str = None,
         updated_by: str = None,
     ) -> StockTransfer:
-        """Update carrier, vehicle, driver and estimated delivery details."""
+        """Update carrier, ETA, vehicle and driver information."""
 
         transfer = self._get_transfer(transfer_id)
 
@@ -315,8 +332,9 @@ class StockTransferService:
                 "DISPATCHED or IN_TRANSIT transfers."
             )
 
-        if carrier_name is not None and not carrier_name.strip():
-            raise ValidationError("Carrier name cannot be empty.")
+        if carrier_name is not None:
+            if not isinstance(carrier_name, str) or not carrier_name.strip():
+                raise ValidationError("Carrier name cannot be empty.")
 
         if estimated_delivery_at is not None:
             if not isinstance(estimated_delivery_at, datetime):
@@ -324,7 +342,10 @@ class StockTransferService:
                     "Estimated delivery time must be a datetime."
                 )
 
-            if estimated_delivery_at.tzinfo is None:
+            if (
+                estimated_delivery_at.tzinfo is None
+                or estimated_delivery_at.utcoffset() is None
+            ):
                 raise ValidationError(
                     "Estimated delivery time must include a timezone."
                 )
@@ -343,7 +364,7 @@ class StockTransferService:
                 transfer.driver_contact = driver_contact
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="TRACKING_UPDATED",
                 details=(
                     f"Carrier: {transfer.carrier_name or 'Not provided'}; "
@@ -368,7 +389,7 @@ class StockTransferService:
         details: str = None,
         logged_by: str = None,
     ) -> CarrierLog:
-        """Record a carrier checkpoint or delivery movement event."""
+        """Record a carrier checkpoint or movement event."""
 
         transfer = self._get_transfer(transfer_id)
 
@@ -386,7 +407,7 @@ class StockTransferService:
 
         try:
             log = self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type=event_type.strip().upper(),
                 location=location,
                 details=details,
@@ -405,7 +426,7 @@ class StockTransferService:
         self,
         transfer_id: str,
     ) -> list[CarrierLog]:
-        """Return tracking events ordered by event time."""
+        """Return tracking events in chronological order."""
 
         self._get_transfer(transfer_id)
 
@@ -422,13 +443,13 @@ class StockTransferService:
         received_items: list[dict],
         received_by: str = None,
     ) -> StockTransfer:
-        """Record received quantities after validating the delivery."""
+        """Record good and damaged quantities after validating delivery."""
 
         transfer = self._get_transfer(transfer_id)
 
         if transfer.status != TransferStatus.IN_TRANSIT:
             raise ValidationError(
-                "Cannot receive transfer that is not IN_TRANSIT. "
+                "Cannot receive a transfer that is not IN_TRANSIT. "
                 f"Current status: {transfer.status.value}"
             )
 
@@ -437,82 +458,101 @@ class StockTransferService:
                 "Received items must be a non-empty list."
             )
 
-        expected_item_ids = {item.id for item in transfer.items}
-        transfer_items_by_id = {
-            item.id: item for item in transfer.items
-        }
-        received_dict = {}
+        items_by_id = {item.id: item for item in transfer.items}
+        received_by_id = {}
 
-        for received_item in received_items:
-            if not isinstance(received_item, dict):
+        for entry in received_items:
+            if not isinstance(entry, dict):
                 raise ValidationError(
                     "Each received item must be a dictionary."
                 )
 
-            item_id = received_item.get("item_id")
+            item_id = entry.get("item_id")
 
-            if not item_id or item_id not in expected_item_ids:
+            if not item_id or item_id not in items_by_id:
                 raise ValidationError(
                     f"Invalid transfer item ID: {item_id}"
                 )
 
-            if item_id in received_dict:
+            if item_id in received_by_id:
                 raise ValidationError(
                     f"Duplicate receipt entry for item: {item_id}"
                 )
 
-            quantity = received_item.get("quantity_received")
+            good_qty = entry.get("quantity_received")
+            damaged_qty = entry.get("quantity_damaged", 0)
 
-            if (
-                isinstance(quantity, bool)
-                or not isinstance(quantity, int)
-                or quantity < 0
+            for label, quantity in (
+                ("Received quantity", good_qty),
+                ("Damaged quantity", damaged_qty),
             ):
+                if (
+                    isinstance(quantity, bool)
+                    or not isinstance(quantity, int)
+                    or quantity < 0
+                ):
+                    raise ValidationError(
+                        f"{label} must be a non-negative integer."
+                    )
+
+            dispatched_qty = items_by_id[item_id].quantity_dispatched
+
+            if good_qty + damaged_qty > dispatched_qty:
                 raise ValidationError(
-                    "Received quantity must be a non-negative integer."
+                    "Good and damaged quantities cannot exceed "
+                    "the dispatched quantity."
                 )
 
-            dispatched_quantity = (
-                transfer_items_by_id[item_id].quantity_dispatched
-            )
+            received_by_id[item_id] = {
+                "good": good_qty,
+                "damaged": damaged_qty,
+            }
 
-            if quantity > dispatched_quantity:
-                raise ValidationError(
-                    "Received quantity cannot exceed dispatched quantity."
-                )
+        expected_ids = set(items_by_id)
+        supplied_ids = set(received_by_id)
 
-            received_dict[item_id] = quantity
-
-        missing_item_ids = expected_item_ids - set(received_dict)
-
-        if missing_item_ids:
+        if expected_ids != supplied_ids:
+            missing_ids = sorted(expected_ids - supplied_ids)
             raise ValidationError(
-                "Missing receipt entries for items: "
-                f"{sorted(missing_item_ids)}"
+                f"Missing receipt entries for items: {missing_ids}"
             )
 
         try:
-            for item in transfer.items:
-                item.quantity_received = received_dict[item.id]
+            for item_id, quantities in received_by_id.items():
+                item = items_by_id[item_id]
+                item.quantity_received = quantities["good"]
+                item.quantity_damaged = quantities["damaged"]
 
+            now = self._utc_now()
             transfer.status = TransferStatus.RECEIVED
-            transfer.received_at = self._utc_now()
-            transfer.delivered_at = transfer.received_at
+            transfer.received_at = now
+            transfer.delivered_at = now
             transfer.received_by = received_by
 
             total_dispatched = sum(
                 item.quantity_dispatched for item in transfer.items
             )
-            total_received = sum(
+            total_good = sum(
                 item.quantity_received for item in transfer.items
+            )
+            total_damaged = sum(
+                item.quantity_damaged for item in transfer.items
+            )
+            total_missing = sum(
+                item.quantity_dispatched
+                - item.quantity_received
+                - item.quantity_damaged
+                for item in transfer.items
             )
 
             self._add_carrier_log(
-                transfer=transfer,
+                transfer,
                 event_type="DELIVERED",
                 details=(
-                    f"Dispatched units: {total_dispatched}; "
-                    f"Received units: {total_received}"
+                    f"Dispatched: {total_dispatched}; "
+                    f"Good received: {total_good}; "
+                    f"Damaged: {total_damaged}; "
+                    f"Missing: {total_missing}"
                 ),
                 logged_by=received_by,
             )

@@ -301,3 +301,57 @@ def test_carrier_event_rejected_for_draft_transfer(db_session):
         )
 
     assert transfer.status == TransferStatus.DRAFT
+def test_damaged_and_missing_stock_reconciliation(db_session):
+    """Damaged and missing units must be accounted for separately."""
+    create_branches(db_session)
+
+    service = StockTransferService(db_session)
+    reconciler = MultiBranchReconciliationEngine(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [
+            {
+                "product_id": "p1",
+                "product_name": "Test Product",
+                "quantity_dispatched": 10,
+                "unit_cost": 100.0,
+            }
+        ],
+    )
+
+    service.dispatch_transfer(transfer.id)
+    service.start_transit(transfer.id)
+
+    service.receive_and_record_delivery(
+        transfer.id,
+        [
+            {
+                "item_id": transfer.items[0].id,
+                "quantity_received": 7,
+                "quantity_damaged": 2,
+            }
+        ],
+        received_by="Store Manager",
+    )
+
+    db_session.refresh(transfer)
+    item = transfer.items[0]
+
+    assert item.quantity_received == 7
+    assert item.quantity_damaged == 2
+
+    # 10 dispatched = 7 good + 2 damaged + 1 missing.
+    log = reconciler.reconcile_transfer(
+        transfer.id,
+        reconciled_by="Inventory Auditor",
+    )
+
+    assert log.total_dispatched_units == 10
+    assert log.total_received_units == 7
+    assert log.variance_units == 3
+    assert log.total_transit_loss_value == 300.0
+    assert "Damaged units: 2" in log.remarks
+    assert "Missing units: 1" in log.remarks
+    assert transfer.status == TransferStatus.DISPUTED

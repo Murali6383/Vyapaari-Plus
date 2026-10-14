@@ -271,6 +271,12 @@ class TransferItem(Base, TimestampMixin):
         "StockTransfer",
         back_populates="items",
     )
+    
+    quantity_damaged: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
 
 
 class ReconciliationLog(Base, TimestampMixin):
