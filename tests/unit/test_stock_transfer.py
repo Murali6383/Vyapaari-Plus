@@ -1,9 +1,12 @@
 
+from datetime import datetime, timezone
+
 import pytest
 
 from app.core.exceptions import ValidationError
 from app.modules.inventory.models import (
     Branch,
+    CarrierLog,
     StockTransfer,
     TransferStatus,
 )
@@ -68,6 +71,8 @@ def test_stock_transfer_lifecycle(db_session):
 
     assert dispatched.status == TransferStatus.DISPATCHED
     assert dispatched.vehicle_number == "DL-01-AB-1234"
+    assert dispatched.delivery_challan_number.startswith("CHL-")
+    assert dispatched.gate_pass_number.startswith("GATE-")
 
     # 3. Start transit
     in_transit = service.start_transit(transfer.id)
@@ -90,6 +95,7 @@ def test_stock_transfer_lifecycle(db_session):
 
     assert received.status == TransferStatus.RECEIVED
     assert received.items[0].quantity_received == 19
+    assert received.delivered_at is not None
 
     # 5. Reconcile the quantity variance
     rec_log = reconciler.reconcile_transfer(
@@ -185,5 +191,113 @@ def test_cannot_start_transit_before_dispatch(db_session):
 
     with pytest.raises(ValidationError):
         service.start_transit(transfer.id)
+
+    assert transfer.status == TransferStatus.DRAFT
+
+
+def test_dispatch_generates_delivery_documents(db_session):
+    """Dispatch should generate a challan, gate pass and audit event."""
+    create_branches(db_session)
+    service = StockTransferService(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [{"product_id": "p1", "quantity_dispatched": 5}],
+    )
+
+    dispatched = service.dispatch_transfer(
+        transfer.id,
+        vehicle_number="TN-32-AB-1234",
+    )
+
+    assert dispatched.status == TransferStatus.DISPATCHED
+    assert dispatched.delivery_challan_number.startswith("CHL-")
+    assert dispatched.gate_pass_number.startswith("GATE-")
+
+    event_types = {
+        log.event_type for log in dispatched.carrier_logs
+    }
+    assert "DISPATCHED" in event_types
+
+
+def test_update_carrier_tracking(db_session):
+    """Carrier, ETA and vehicle details should be updated."""
+    create_branches(db_session)
+    service = StockTransferService(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [{"product_id": "p1", "quantity_dispatched": 5}],
+    )
+
+    service.dispatch_transfer(transfer.id)
+
+    eta = datetime(
+        2026, 10, 15, 12, 0, tzinfo=timezone.utc
+    )
+
+    updated = service.update_carrier_tracking(
+        transfer.id,
+        carrier_name="FastTrack Logistics",
+        estimated_delivery_at=eta,
+        vehicle_number="TN-32-AB-1234",
+    )
+
+    assert updated.carrier_name == "FastTrack Logistics"
+    assert updated.vehicle_number == "TN-32-AB-1234"
+    assert updated.estimated_delivery_at is not None
+
+
+def test_record_and_get_carrier_events(db_session):
+    """Carrier events should be saved and returned in tracking history."""
+    create_branches(db_session)
+    service = StockTransferService(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [{"product_id": "p1", "quantity_dispatched": 5}],
+    )
+
+    service.dispatch_transfer(transfer.id)
+    service.start_transit(transfer.id)
+
+    service.record_carrier_event(
+        transfer.id,
+        event_type="LOCATION_UPDATE",
+        location="Chennai",
+        details="Shipment reached Chennai hub",
+        logged_by="Transport Manager",
+    )
+
+    history = service.get_tracking_history(transfer.id)
+
+    assert len(history) >= 1
+    assert any(
+        event.event_type == "LOCATION_UPDATE"
+        and event.location == "Chennai"
+        for event in history
+    )
+
+
+def test_carrier_event_rejected_for_draft_transfer(db_session):
+    """Carrier events should not be recorded for a draft transfer."""
+    create_branches(db_session)
+    service = StockTransferService(db_session)
+
+    transfer = service.create_transfer_request(
+        "b1",
+        "b2",
+        [{"product_id": "p1", "quantity_dispatched": 5}],
+    )
+
+    with pytest.raises(ValidationError):
+        service.record_carrier_event(
+            transfer.id,
+            event_type="LOCATION_UPDATE",
+            location="Chennai",
+        )
 
     assert transfer.status == TransferStatus.DRAFT
