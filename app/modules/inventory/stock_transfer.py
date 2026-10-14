@@ -122,7 +122,7 @@ class StockTransferService:
         vehicle_number: str = None,
         driver_contact: str = None,
     ) -> StockTransfer:
-        """Dispatch a draft transfer for delivery."""
+        """Mark a draft transfer as dispatched."""
 
         transfer = (
             self.db.query(StockTransfer)
@@ -144,10 +144,38 @@ class StockTransferService:
                 "Cannot dispatch a transfer without items."
             )
 
-        transfer.status = TransferStatus.IN_TRANSIT
+        transfer.status = TransferStatus.DISPATCHED
         transfer.dispatched_at = datetime.now(timezone.utc)
         transfer.vehicle_number = vehicle_number
         transfer.driver_contact = driver_contact
+
+        try:
+            self.db.commit()
+            self.db.refresh(transfer)
+            return transfer
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def start_transit(self, transfer_id: str) -> StockTransfer:
+        """Mark a dispatched transfer as being in transit."""
+
+        transfer = (
+            self.db.query(StockTransfer)
+            .filter(StockTransfer.id == transfer_id)
+            .first()
+        )
+
+        if not transfer:
+            raise EntityNotFoundError("StockTransfer", transfer_id)
+
+        if transfer.status != TransferStatus.DISPATCHED:
+            raise ValidationError(
+                "Only DISPATCHED transfers can enter transit. "
+                f"Current status: {transfer.status.value}"
+            )
+
+        transfer.status = TransferStatus.IN_TRANSIT
 
         try:
             self.db.commit()
