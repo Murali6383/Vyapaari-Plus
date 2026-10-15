@@ -1,4 +1,3 @@
-
 import uuid
 from datetime import datetime, timezone
 
@@ -7,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import EntityNotFoundError, ValidationError
 from app.modules.inventory.models import (
     CarrierLog,
+    StockBatch,
     StockTransfer,
     TransferItem,
     TransferStatus,
@@ -226,6 +226,45 @@ class StockTransferService:
             self.db.rollback()
             raise
 
+    def _deduct_source_stock(self, transfer: StockTransfer) -> None:
+        """Deduct dispatched quantities from the source branch batches."""
+        for item in transfer.items:
+            query = self.db.query(StockBatch).filter(
+                StockBatch.branch_id == transfer.source_branch_id,
+                StockBatch.product_id == item.product_id,
+            )
+
+            if item.batch_number:
+                query = query.filter(
+                    StockBatch.batch_number == item.batch_number
+                )
+
+            batches = query.all()
+
+            # If no batch was specified, choose one batch that can
+            # satisfy the complete item quantity.
+            batch = next(
+                (
+                    candidate
+                    for candidate in batches
+                    if candidate.quantity >= item.quantity_dispatched
+                ),
+                None,
+            )
+
+            if batch is None:
+                raise ValidationError(
+                    f"Insufficient stock for product {item.product_id}. "
+                    f"Required: {item.quantity_dispatched}; "
+                    f"available in matching batches: "
+                    f"{sum(candidate.quantity for candidate in batches)}."
+                )
+
+            # Persist the selected batch on the transfer item so the
+            # receiving branch can use the same batch number.
+            item.batch_number = batch.batch_number
+            batch.quantity -= item.quantity_dispatched
+
     def dispatch_transfer(
         self,
         transfer_id: str,
@@ -248,6 +287,8 @@ class StockTransferService:
             )
 
         try:
+            self._deduct_source_stock(transfer)
+
             if not transfer.delivery_challan_number:
                 transfer.delivery_challan_number = (
                     self._document_number("CHL")
@@ -520,8 +561,69 @@ class StockTransferService:
         try:
             for item_id, quantities in received_by_id.items():
                 item = items_by_id[item_id]
-                item.quantity_received = quantities["good"]
+                good_qty = quantities["good"]
+
+                item.quantity_received = good_qty
                 item.quantity_damaged = quantities["damaged"]
+
+                # Damaged and missing units must not increase usable stock.
+                if good_qty == 0:
+                    continue
+
+                if not item.batch_number:
+                    raise ValidationError(
+                        f"Batch number missing for transfer item {item.id}."
+                    )
+
+                destination_batch = (
+                    self.db.query(StockBatch)
+                    .filter(
+                        StockBatch.branch_id
+                        == transfer.destination_branch_id,
+                        StockBatch.product_id == item.product_id,
+                        StockBatch.batch_number == item.batch_number,
+                    )
+                    .with_for_update()
+                    .first()
+                )
+
+                if destination_batch is None:
+                    source_batch = (
+                        self.db.query(StockBatch)
+                        .filter(
+                            StockBatch.branch_id
+                            == transfer.source_branch_id,
+                            StockBatch.product_id == item.product_id,
+                            StockBatch.batch_number == item.batch_number,
+                        )
+                        .first()
+                    )
+
+                    destination_batch = StockBatch(
+                        id=str(uuid.uuid4()),
+                        product_id=item.product_id,
+                        branch_id=transfer.destination_branch_id,
+                        batch_number=item.batch_number,
+                        quantity=good_qty,
+                        purchase_price=(
+                            source_batch.purchase_price
+                            if source_batch is not None
+                            else item.unit_cost
+                        ),
+                        selling_price=(
+                            source_batch.selling_price
+                            if source_batch is not None
+                            else 0
+                        ),
+                        expiry_date=(
+                            source_batch.expiry_date
+                            if source_batch is not None
+                            else None
+                        ),
+                    )
+                    self.db.add(destination_batch)
+                else:
+                    destination_batch.quantity += good_qty
 
             now = self._utc_now()
             transfer.status = TransferStatus.RECEIVED

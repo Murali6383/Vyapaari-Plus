@@ -1,10 +1,14 @@
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import EntityNotFoundError, ValidationError
 from app.modules.inventory.models import (
     Branch,
+    ReconciliationApproval,
+    ReconciliationLog,
     StockBatch,
     StockTransfer,
+    TransferItem,
     TransferStatus,
 )
 
@@ -15,9 +19,21 @@ class InventoryRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    # ------------------------------------------------------------------
+    # Transfers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _transfer_detail_options():
+        """Eager-load children in two extra queries instead of N+1."""
+        return (
+            selectinload(StockTransfer.items),
+            selectinload(StockTransfer.reconciliation),
+        )
+
     def get_all_transfers(self) -> list[StockTransfer]:
         return (
             self.db.query(StockTransfer)
+            .options(*self._transfer_detail_options())
             .order_by(StockTransfer.created_at.desc())
             .all()
         )
@@ -27,6 +43,7 @@ class InventoryRepository:
     ) -> StockTransfer:
         transfer = (
             self.db.query(StockTransfer)
+            .options(*self._transfer_detail_options())
             .filter(StockTransfer.id == transfer_id)
             .first()
         )
@@ -39,8 +56,10 @@ class InventoryRepository:
     def get_transfers_by_status(
         self, status: TransferStatus
     ) -> list[StockTransfer]:
+        # Served by ix_stock_transfers_status_created.
         return (
             self.db.query(StockTransfer)
+            .options(*self._transfer_detail_options())
             .filter(StockTransfer.status == status)
             .order_by(StockTransfer.created_at.desc())
             .all()
@@ -59,12 +78,172 @@ class InventoryRepository:
 
         return (
             self.db.query(StockTransfer)
+            .options(*self._transfer_detail_options())
             .order_by(StockTransfer.created_at.desc())
             .offset(offset)
             .limit(limit)
             .all()
         )
 
+    def get_transfers_by_branch(
+        self,
+        branch_id: str,
+        direction: str = "any",
+        status: TransferStatus = None,
+    ) -> list[StockTransfer]:
+        """Transfers leaving ("source"), entering ("destination") or
+        touching ("any") a branch, optionally filtered by status.
+
+        Served by ix_stock_transfers_source_status and
+        ix_stock_transfers_destination_status.
+        """
+        if direction not in ("source", "destination", "any"):
+            raise ValidationError(
+                "Direction must be source, destination or any."
+            )
+
+        query = self.db.query(StockTransfer).options(
+            *self._transfer_detail_options()
+        )
+
+        if direction == "source":
+            query = query.filter(StockTransfer.source_branch_id == branch_id)
+        elif direction == "destination":
+            query = query.filter(
+                StockTransfer.destination_branch_id == branch_id
+            )
+        else:
+            query = query.filter(
+                (StockTransfer.source_branch_id == branch_id)
+                | (StockTransfer.destination_branch_id == branch_id)
+            )
+
+        if status is not None:
+            query = query.filter(StockTransfer.status == status)
+
+        return query.order_by(StockTransfer.created_at.desc()).all()
+
+    def count_transfers_by_status(self) -> dict[str, int]:
+        """Return {status value: count}; every status is present."""
+        counts = {status.value: 0 for status in TransferStatus}
+
+        rows = (
+            self.db.query(StockTransfer.status, func.count(StockTransfer.id))
+            .group_by(StockTransfer.status)
+            .all()
+        )
+
+        for status, count in rows:
+            counts[status.value] = count
+
+        return counts
+
+    def get_transfer_items(self, transfer_id: str) -> list[TransferItem]:
+        return (
+            self.db.query(TransferItem)
+            .filter(TransferItem.transfer_id == transfer_id)
+            .order_by(TransferItem.product_name.asc(), TransferItem.id.asc())
+            .all()
+        )
+
+    def get_transfer_items_by_product(
+        self,
+        product_id: str,
+        batch_number: str = None,
+    ) -> list[TransferItem]:
+        """Served by ix_transfer_items_product_batch."""
+        query = self.db.query(TransferItem).filter(
+            TransferItem.product_id == product_id
+        )
+
+        if batch_number is not None:
+            query = query.filter(TransferItem.batch_number == batch_number)
+
+        return query.order_by(TransferItem.created_at.desc()).all()
+
+    # ------------------------------------------------------------------
+    # Reconciliation and approvals
+    # ------------------------------------------------------------------
+    def get_reconciliation_by_transfer_id(
+        self, transfer_id: str
+    ) -> ReconciliationLog | None:
+        """Return the single reconciliation log of a transfer, if any."""
+        return (
+            self.db.query(ReconciliationLog)
+            .filter(ReconciliationLog.transfer_id == transfer_id)
+            .first()
+        )
+
+    def list_reconciliations(
+        self,
+        resolution_status: str = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> list[ReconciliationLog]:
+        if offset < 0:
+            raise ValidationError("Offset cannot be negative.")
+
+        if limit < 1 or limit > 500:
+            raise ValidationError("Limit must be between 1 and 500.")
+
+        if resolution_status is not None:
+            resolution_status = resolution_status.strip().upper()
+            if resolution_status not in ("PENDING", "RESOLVED"):
+                raise ValidationError(
+                    "Resolution status must be PENDING or RESOLVED."
+                )
+
+        query = self.db.query(ReconciliationLog)
+
+        if resolution_status is not None:
+            # Served by ix_reconciliation_logs_status_reconciled_at.
+            query = query.filter(
+                ReconciliationLog.resolution_status == resolution_status
+            )
+
+        return (
+            query.order_by(ReconciliationLog.reconciled_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+    def get_disputed_transfers_awaiting_approval(
+        self,
+    ) -> list[StockTransfer]:
+        """DISPUTED transfers whose reconciliation is still PENDING."""
+        return (
+            self.db.query(StockTransfer)
+            .options(*self._transfer_detail_options())
+            .join(
+                ReconciliationLog,
+                ReconciliationLog.transfer_id == StockTransfer.id,
+            )
+            .filter(
+                StockTransfer.status == TransferStatus.DISPUTED,
+                ReconciliationLog.resolution_status == "PENDING",
+            )
+            .order_by(ReconciliationLog.reconciled_at.asc())
+            .all()
+        )
+
+    def get_approval_history(
+        self, transfer_id: str
+    ) -> list[ReconciliationApproval]:
+        """Approval decisions for a transfer, oldest first."""
+        return (
+            self.db.query(ReconciliationApproval)
+            .filter(ReconciliationApproval.transfer_id == transfer_id)
+            .order_by(
+                ReconciliationApproval.decided_at.asc(),
+                ReconciliationApproval.id.asc(),
+            )
+            .all()
+        )
+
+    # ------------------------------------------------------------------
+    # Branches and batches
+    # ------------------------------------------------------------------
     def get_branches(self) -> list[Branch]:
         return (
             self.db.query(Branch)
