@@ -1,4 +1,5 @@
-﻿from datetime import datetime
+﻿
+from datetime import datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, status
@@ -8,19 +9,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 # Import models so SQLAlchemy registers their tables.
-from app.modules.inventory.models import (
-    CarrierLog,
-    ReconciliationApproval,
-    ReconciliationLog,
-    StockTransfer,
-)
+from app.modules.inventory.models import CarrierLog, StockTransfer
 from app.modules.inventory.service import InventoryService
 from app.core.exceptions import (
     EntityNotFoundError,
-    ValidationError,
     VyapaariException,
 )
 from app.db.session import get_db_session, init_db
+
 
 app = FastAPI(
     title="Vyapaari+ Inventory Transfer API",
@@ -105,7 +101,9 @@ class ReconcileInput(BaseModel):
 
 class ApprovalInput(BaseModel):
     approver: str = Field(min_length=1)
-    decision: str = Field(pattern="^(APPROVED|REJECTED|approved|rejected)$")
+    decision: str = Field(
+        pattern="^(APPROVED|REJECTED|approved|rejected)$"
+    )
     remarks: str | None = None
 
 
@@ -277,18 +275,20 @@ def reconcile_transfer(
         resolution_status=payload.resolution_status,
         remarks=payload.remarks,
     )
-    return jsonable_encoder({
-        "id": log.id,
-        "transfer_id": log.transfer_id,
-        "total_dispatched_units": log.total_dispatched_units,
-        "total_received_units": log.total_received_units,
-        "variance_units": log.variance_units,
-        "total_transit_loss_value": log.total_transit_loss_value,
-        "resolution_status": log.resolution_status,
-        "reconciled_by": log.reconciled_by,
-        "reconciled_at": log.reconciled_at,
-        "remarks": log.remarks,
-    })
+    return jsonable_encoder(
+        {
+            "id": log.id,
+            "transfer_id": log.transfer_id,
+            "total_dispatched_units": log.total_dispatched_units,
+            "total_received_units": log.total_received_units,
+            "variance_units": log.variance_units,
+            "total_transit_loss_value": log.total_transit_loss_value,
+            "resolution_status": log.resolution_status,
+            "reconciled_by": log.reconciled_by,
+            "reconciled_at": log.reconciled_at,
+            "remarks": log.remarks,
+        }
+    )
 
 
 @app.post("/api/transfers/{transfer_id}/approval")
@@ -303,14 +303,16 @@ def approve_reconciliation(
         decision=payload.decision,
         remarks=payload.remarks,
     )
-    return jsonable_encoder({
-        "id": approval.id,
-        "transfer_id": approval.transfer_id,
-        "approver": approval.approver,
-        "decision": approval.decision,
-        "remarks": approval.remarks,
-        "decided_at": approval.decided_at,
-    })
+    return jsonable_encoder(
+        {
+            "id": approval.id,
+            "transfer_id": approval.transfer_id,
+            "approver": approval.approver,
+            "decision": approval.decision,
+            "remarks": approval.remarks,
+            "decided_at": approval.decided_at,
+        }
+    )
 
 
 @app.get("/api/transfers/{transfer_id}/reconciliation")

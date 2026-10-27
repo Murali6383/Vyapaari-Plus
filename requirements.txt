@@ -1,3 +1,4 @@
+
 # Core Dependencies
 pyside6>=6.7.0
 sqlalchemy>=2.0.30
@@ -20,7 +21,7 @@ pytest-cov>=5.0.0
 pytest-qt>=4.4.0
 pytest-mock>=3.14.0
 
-# GST engine
+# GST Engine
 jsonschema>=4.23.0
 pyjwt>=2.8.0
 cryptography>=42.0.0
