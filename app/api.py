@@ -40,15 +40,22 @@ async def handle_domain_error(request, exc: VyapaariException):
         "VALIDATION_ERROR": 422,
         "INSUFFICIENT_STOCK": 409,
     }
+
     return JSONResponse(
         status_code=code_to_status.get(exc.code, 400),
-        content={"error": exc.code, "detail": exc.message},
+        content={
+            "error": exc.code,
+            "detail": exc.message,
+        },
     )
 
 
 class TransferItemInput(BaseModel):
     product_id: str = Field(min_length=1, max_length=100)
-    product_name: str = Field(default="Unknown Product", max_length=200)
+    product_name: str = Field(
+        default="Unknown Product",
+        max_length=200,
+    )
     quantity_dispatched: int = Field(gt=0)
     unit_cost: float = Field(default=0.0, ge=0)
     batch_number: str | None = None
@@ -155,22 +162,33 @@ def carrier_log_to_dict(log: CarrierLog) -> dict[str, Any]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "inventory-transfer-api"}
+    return {
+        "status": "ok",
+        "service": "inventory-transfer-api",
+    }
 
 
-@app.post("/api/transfers", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/api/transfers",
+    status_code=status.HTTP_201_CREATED,
+)
 def create_transfer(
     payload: CreateTransferInput,
     db: Session = Depends(get_db_session),
 ):
     service = InventoryService(db)
+
     transfer = service.transfers.create_transfer_request(
         source_branch_id=payload.source_branch_id,
         destination_branch_id=payload.destination_branch_id,
-        items=[item.model_dump() for item in payload.items],
+        items=[
+            item.model_dump()
+            for item in payload.items
+        ],
         dispatched_by=payload.dispatched_by,
         notes=payload.notes,
     )
+
     return transfer_to_dict(transfer)
 
 
@@ -184,8 +202,13 @@ def get_transfer(
         .filter(StockTransfer.id == transfer_id)
         .first()
     )
+
     if transfer is None:
-        raise EntityNotFoundError("StockTransfer", transfer_id)
+        raise EntityNotFoundError(
+            "StockTransfer",
+            transfer_id,
+        )
+
     return transfer_to_dict(transfer)
 
 
@@ -200,6 +223,7 @@ def dispatch_transfer(
         vehicle_number=payload.vehicle_number,
         driver_contact=payload.driver_contact,
     )
+
     return transfer_to_dict(transfer)
 
 
@@ -208,7 +232,10 @@ def start_transit(
     transfer_id: str,
     db: Session = Depends(get_db_session),
 ):
-    transfer = InventoryService(db).transfers.start_transit(transfer_id)
+    transfer = InventoryService(db).transfers.start_transit(
+        transfer_id
+    )
+
     return transfer_to_dict(transfer)
 
 
@@ -222,6 +249,7 @@ def update_tracking(
         transfer_id,
         **payload.model_dump(exclude_unset=True),
     )
+
     return transfer_to_dict(transfer)
 
 
@@ -235,6 +263,7 @@ def record_tracking_event(
         transfer_id,
         **payload.model_dump(),
     )
+
     return carrier_log_to_dict(log)
 
 
@@ -243,8 +272,14 @@ def get_tracking_history(
     transfer_id: str,
     db: Session = Depends(get_db_session),
 ):
-    logs = InventoryService(db).transfers.get_tracking_history(transfer_id)
-    return [carrier_log_to_dict(log) for log in logs]
+    logs = InventoryService(db).transfers.get_tracking_history(
+        transfer_id
+    )
+
+    return [
+        carrier_log_to_dict(log)
+        for log in logs
+    ]
 
 
 @app.post("/api/transfers/{transfer_id}/receive")
@@ -256,10 +291,12 @@ def receive_transfer(
     transfer = InventoryService(db).transfers.receive_and_record_delivery(
         transfer_id,
         received_items=[
-            item.model_dump() for item in payload.received_items
+            item.model_dump()
+            for item in payload.received_items
         ],
         received_by=payload.received_by,
     )
+
     return transfer_to_dict(transfer)
 
 
@@ -275,6 +312,7 @@ def reconcile_transfer(
         resolution_status=payload.resolution_status,
         remarks=payload.remarks,
     )
+
     return jsonable_encoder(
         {
             "id": log.id,
@@ -303,6 +341,7 @@ def approve_reconciliation(
         decision=payload.decision,
         remarks=payload.remarks,
     )
+
     return jsonable_encoder(
         {
             "id": approval.id,
@@ -320,6 +359,8 @@ def get_reconciliation_summary(
     transfer_id: str,
     db: Session = Depends(get_db_session),
 ):
-    return jsonable_encoder(
-        InventoryService(db).reconciliation.build_summary(transfer_id)
+    summary = InventoryService(db).reconciliation.build_summary(
+        transfer_id
     )
+
+    return jsonable_encoder(summary)
